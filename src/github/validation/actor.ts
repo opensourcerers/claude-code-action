@@ -8,79 +8,81 @@
 import type { Octokit } from "@octokit/rest";
 import type { GitHubContext } from "../context";
 
+function isAllowedBot(actor: string, allowedBots: string): boolean {
+  const trimmed = allowedBots.trim();
+  if (trimmed === "*") return true;
+  if (!trimmed) return false;
+
+  const allowedList = trimmed
+    .split(",")
+    .map((bot) =>
+      bot
+        .trim()
+        .toLowerCase()
+        .replace(/\[bot\]$/, ""),
+    )
+    .filter((bot) => bot.length > 0);
+
+  const normalizedActor = actor.toLowerCase().replace(/\[bot\]$/, "");
+  return allowedList.includes(normalizedActor);
+}
+
 export async function checkHumanActor(
   octokit: Octokit,
   githubContext: GitHubContext,
 ) {
   const allowedBots = githubContext.inputs.allowedBots;
-  const botName = githubContext.actor.toLowerCase().replace(/\[bot\]$/, "");
+  const actor = githubContext.actor;
 
-  // Check allowed bots list before making API calls, since some bot actors
-  // (e.g., "Copilot") don't exist as GitHub users and will 404
-  if (allowedBots.trim() === "*") {
-    // We still need to check if this is actually a bot, so fall through to API check
-  } else if (allowedBots) {
-    const allowedBotsList = allowedBots
-      .split(",")
-      .map((bot) =>
-        bot
-          .trim()
-          .toLowerCase()
-          .replace(/\[bot\]$/, ""),
-      )
-      .filter((bot) => bot.length > 0);
-
-    if (allowedBotsList.includes(botName)) {
-      console.log(
-        `Bot ${botName} is in allowed list, skipping human actor check`,
-      );
-      return;
-    }
-  }
-
-  // Fetch user information from GitHub API
-  let userData;
+  // Resolve the actor's account type before consulting allowed_bots so the
+  // allow-list only ever applies to non-User accounts. Some app actors
+  // (e.g. GitHub Copilot with GITHUB_ACTOR="Copilot") are not resolvable
+  // via the Users API and 404 — that path is handled in the catch below.
+  let actorType: string;
   try {
-    const response = await octokit.users.getByUsername({
-      username: githubContext.actor,
+    const { data: userData } = await octokit.users.getByUsername({
+      username: actor,
     });
-    userData = response.data;
-  } catch (error: any) {
-    if (error.status === 404) {
-      // Actor doesn't exist as a GitHub user (e.g., "Copilot")
-      // If all bots are allowed, let it through
-      if (allowedBots.trim() === "*") {
+    actorType = userData.type;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.message.includes("Not Found") ||
+        error.message.includes("is not a user"))
+    ) {
+      // Unresolvable actors are GitHub Apps without a backing user account.
+      if (isAllowedBot(actor, allowedBots)) {
         console.log(
-          `All bots are allowed, skipping human actor check for: ${githubContext.actor}`,
+          `Actor ${actor} is in allowed_bots list, skipping human actor check`,
         );
         return;
       }
+      const botName = actor.toLowerCase().replace(/\[bot\]$/, "");
       throw new Error(
-        `Workflow initiated by unknown actor: ${githubContext.actor} (not found as a GitHub user). Add to allowed_bots list or use '*' to allow all bots.`,
+        `Workflow initiated by non-human actor: ${botName} (actor not found on GitHub). Add bot to allowed_bots list or use '*' to allow all bots.`,
       );
     }
     throw error;
   }
 
-  const actorType = userData.type;
-
   console.log(`Actor type: ${actorType}`);
 
-  // Check bot permissions if actor is not a User
   if (actorType !== "User") {
-    // Check if all bots are allowed
-    if (allowedBots.trim() === "*") {
+    // GitHub Apps and other bot accounts.
+    if (isAllowedBot(actor, allowedBots)) {
       console.log(
-        `All bots are allowed, skipping human actor check for: ${githubContext.actor}`,
+        `Actor ${actor} is in allowed_bots list, skipping human actor check`,
       );
       return;
     }
-
-    // Bot not allowed (we already checked the allowed list above)
+    const botName = actor.toLowerCase().replace(/\[bot\]$/, "");
     throw new Error(
       `Workflow initiated by non-human actor: ${botName} (type: ${actorType}). Add bot to allowed_bots list or use '*' to allow all bots.`,
     );
   }
 
-  console.log(`Verified human actor: ${githubContext.actor}`);
+  // Regular User account. allowed_bots is only for bot actors and is not
+  // consulted here; write-access enforcement for users happens separately
+  // in checkWritePermissions.
+  console.log(`Verified human actor: ${actor}`);
 }
